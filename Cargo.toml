@@ -1,0 +1,24 @@
+[package]
+name = "ce-coord"
+version = "0.1.0"
+edition = "2024"
+description = "Self-organizing coordination primitives on the CE mesh — typed streams and single-writer replicated collections. An SDK library built ON CE primitives, not part of the node."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-coord"
+
+[lib]
+name = "ce_coord"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coord"
+path = "src/bin/coord.rs"
+
+[dependencies]
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }   # the only CE dependency: mesh transport over the local node API
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-std", "io-util"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
