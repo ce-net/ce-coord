@@ -93,12 +93,21 @@ converge.
 - **Catch-up is O(missed), not O(log).** Steady-state readers apply the live broadcast and never ask
   for catch-up. Only a reader that fell behind (just joined, or dropped messages) pulls a tail, and
   only the part it is missing.
-- **The honest limits of v0**, and where they go next:
-  - *Single writer* → a write outage stalls progress. **Next:** Raft leader election among a small
-    writer set (`Replicated` already isolates the role); collection call sites don't change.
-  - *Unbounded log* → catch-up of a long-lived collection is expensive. **Next:** periodic
-    snapshots to CE's content-addressed blob store (`put_object`), so a fresh reader fetches a
-    snapshot by CID then tails from there.
+- **Snapshot / bootstrap (shipped).** A state machine that implements [`Snapshot`](src/snapshot.rs)
+  can be checkpointed: the writer serializes its state to a content-addressed object via `ce-rs`
+  (`put_object`), records the `(base_version, cid)` checkpoint, and **compacts** its log (drops every
+  op the snapshot already covers). A fresh `Replicated::snapshot_reader` fetches the snapshot by CID,
+  loads it, and tails only newer ops — instead of replaying the writer's whole log from version 1.
+  This bounds log growth for long-lived Notes spaces and Drive trees. The keystone guarantee
+  (*snapshot + tail == full replay*) is property-tested.
+- **Multi-writer merged-log (shipped).** [`Merged<M>`](src/merged.rs) runs **one writer-log per
+  device** and folds the **key-ordered set union** of every device's ops into a [`MergeMachine`].
+  Because the fold is over a sorted set, every replica converges to the same state regardless of
+  delivery order — **leaderless, no Raft**. This is deliberate: Raft would stall offline edits (no
+  quorum while a device is offline), which is exactly the local-first case CE targets. CE Drive's
+  `DriveTree` move-CRDT and CE Notes' `MergeLog` are the intended consumers — true multi-device
+  concurrent editing with deterministic conflict resolution.
+- **The remaining honest limits of v0**, and where they go next:
   - *Polling pump* (250 ms) → latency floor and a bounded inbox ring. **Next:** the node's SSE
     message stream (`GET /mesh/messages/stream`) for push delivery; the protocol is unchanged.
   - *Open membership* → anyone can read. **Next:** gate the op/catch-up topics behind a `ce-cap`

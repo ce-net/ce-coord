@@ -45,11 +45,15 @@
 //! See `README.md` for the wire protocol, failure model, and how it scales.
 
 pub mod collections;
+pub mod merged;
 pub mod replicated;
+pub mod snapshot;
 pub mod stream;
 
 pub use collections::{RCell, RCounter, RMap, RSet, RVec};
+pub use merged::{MergeKey, MergeMachine, Merged, WriterLog};
 pub use replicated::{Replicated, StateMachine, Version};
+pub use snapshot::{Checkpoint, Snapshot};
 pub use stream::Stream;
 
 use std::collections::{HashMap, HashSet, VecDeque};

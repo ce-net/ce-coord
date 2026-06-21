@@ -28,6 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
+use crate::snapshot::{Checkpoint, Snapshot};
 use crate::Coord;
 
 /// A monotonic operation index. The writer assigns it; readers converge to it.
@@ -44,6 +45,18 @@ struct Entry {
 #[derive(Serialize, Deserialize)]
 struct CatchUp {
     from: Version,
+}
+
+/// The writer's catch-up reply: the requested tail of the log, plus — if the writer has compacted
+/// past the requested floor — the [`Checkpoint`] the reader should bootstrap from instead. A reader
+/// that asks for entries the writer has dropped (because they were folded into a snapshot) gets
+/// `redirect = Some(cp)` and an empty/partial `tail`; it loads the snapshot, then re-tails from
+/// `cp.base + 1`. Readers on the pre-snapshot path simply see `redirect = None`.
+#[derive(Serialize, Deserialize)]
+struct CatchUpReply {
+    tail: Vec<Entry>,
+    /// Set when the request floor predates the writer's compaction floor — bootstrap from here.
+    redirect: Option<Checkpoint>,
 }
 
 /// The application-defined state being replicated. Implement this for anything: a map, a set, a
@@ -64,14 +77,30 @@ struct Core<S: StateMachine> {
     pending: BTreeMap<Version, Vec<u8>>,
 }
 
+/// A boxed, owned future — avoids pulling in `futures` just for `BoxFuture`.
+type BoxFut<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+
+/// How a reader loads a redirect snapshot: fetch the object by CID, deserialize it into a fresh `S`,
+/// and return it. Installed only by the snapshot-aware reader constructor; absent on the legacy path
+/// (where a redirect is simply ignored and full replay continues). Async because the fetch hits the
+/// blob store via `ce-rs`.
+type SnapLoader<S> = Arc<dyn Fn(String) -> BoxFut<Result<S>> + Send + Sync>;
+
 struct Inner<S: StateMachine> {
     core: Mutex<Core<S>>,
-    /// The writer's authoritative log, served to readers on catch-up. Empty on readers.
+    /// The writer's authoritative log, served to readers on catch-up. Empty on readers. After a
+    /// compaction it holds only entries with `version > checkpoint.base`.
     log: Mutex<Vec<Entry>>,
+    /// The writer's latest checkpoint, if it has taken one. `None` until the first `checkpoint()`.
+    /// Served to readers that bootstrap or that ask for entries below the compaction floor.
+    checkpoint: Mutex<Option<Checkpoint>>,
     ver_tx: watch::Sender<Version>,
     is_writer: bool,
     op_topic: String,
     coord: Coord,
+    /// Reader-only: how to materialize a redirect snapshot. `None` on the legacy (full-replay) path
+    /// and on writers.
+    snap_loader: Mutex<Option<SnapLoader<S>>>,
 }
 
 impl<S: StateMachine> Inner<S> {
@@ -118,6 +147,59 @@ impl<S: StateMachine> Inner<S> {
         }
         let _ = self.ver_tx.send(newly_applied);
     }
+
+    /// Bootstrap from a checkpoint: fetch + deserialize the snapshot via the installed loader, then
+    /// atomically replace the state machine and set `applied = cp.base`. Older entries (`<= base`)
+    /// are then idempotently ignored by [`ingest`]; the tail applies on top contiguously.
+    ///
+    /// No-op (beyond re-triggering catch-up) if no loader is installed — the legacy reader path
+    /// cannot materialize a snapshot, so it keeps asking for the full log instead. Idempotent: a
+    /// checkpoint at or below the current `applied` is skipped.
+    async fn load_checkpoint(&self, cp: &Checkpoint, trigger: &mpsc::UnboundedSender<Version>) {
+        // Skip if we are already at/ahead of this checkpoint.
+        if self.core.lock().unwrap().applied >= cp.base {
+            return;
+        }
+        let loader = self.snap_loader.lock().unwrap().clone();
+        let Some(loader) = loader else {
+            // Legacy path: ask again from version 1 so a writer that has *not* compacted can still
+            // serve us (the redirect only arrives when compaction happened, but be defensive).
+            let _ = trigger.send(1);
+            return;
+        };
+        let sm = match loader(cp.cid.clone()).await {
+            Ok(sm) => sm,
+            Err(e) => {
+                tracing::warn!(cid = %cp.cid, base = cp.base, "snapshot load failed: {e:#}");
+                return;
+            }
+        };
+        let newly_applied;
+        {
+            let mut core = self.core.lock().unwrap();
+            // Re-check under the lock: another path may have advanced us past the checkpoint.
+            if core.applied >= cp.base {
+                return;
+            }
+            core.sm = sm;
+            core.applied = cp.base;
+            // Drop buffered entries already covered by the snapshot; keep the strictly-newer ones.
+            core.pending.retain(|v, _| *v > cp.base);
+            // Drain any now-contiguous buffered entries on top of the snapshot.
+            loop {
+                let next_version = core.applied + 1;
+                match core.pending.remove(&next_version) {
+                    Some(next) => {
+                        Self::apply_bytes(&mut core, &next);
+                        core.applied = next_version;
+                    }
+                    None => break,
+                }
+            }
+            newly_applied = core.applied;
+        }
+        let _ = self.ver_tx.send(newly_applied);
+    }
 }
 
 /// A replicated state machine. Construct one with [`Replicated::writer`] or [`Replicated::reader`]
@@ -131,15 +213,20 @@ impl<S: StateMachine> Replicated<S> {
     /// Open this node as the **writer** for `name`. Only one writer should exist per `(node, name)`;
     /// the topic is namespaced by the writer's NodeId so distinct writers never collide.
     pub async fn writer(coord: Coord, name: &str) -> Result<Self> {
-        Self::open(coord, name, None).await
+        Self::open(coord, name, None, None).await
     }
 
     /// Open this node as a **read replica** following `writer` (its NodeId hex) for `name`.
     pub async fn reader(coord: Coord, name: &str, writer: &str) -> Result<Self> {
-        Self::open(coord, name, Some(writer.to_string())).await
+        Self::open(coord, name, Some(writer.to_string()), None).await
     }
 
-    async fn open(coord: Coord, name: &str, writer: Option<String>) -> Result<Self> {
+    async fn open(
+        coord: Coord,
+        name: &str,
+        writer: Option<String>,
+        loader: Option<SnapLoader<S>>,
+    ) -> Result<Self> {
         let is_writer = writer.is_none();
         let writer_id = writer.unwrap_or_else(|| coord.node_id().to_string());
         let op_topic = format!("ce-coord/log/{writer_id}/{name}");
@@ -149,22 +236,33 @@ impl<S: StateMachine> Replicated<S> {
         let inner = Arc::new(Inner {
             core: Mutex::new(Core { sm: S::default(), applied: 0, pending: BTreeMap::new() }),
             log: Mutex::new(Vec::new()),
+            checkpoint: Mutex::new(None),
             ver_tx,
             is_writer,
             op_topic: op_topic.clone(),
             coord: coord.clone(),
+            snap_loader: Mutex::new(loader),
         });
 
         if is_writer {
-            // Serve catch-up: hand readers every log entry at or after the version they ask for.
+            // Serve catch-up: hand readers the log tail at or after the version they ask for. If the
+            // request floor predates our compaction floor (the entries were folded into a snapshot),
+            // attach the current checkpoint so the reader bootstraps from it instead of demanding
+            // entries we no longer hold.
             let served = inner.clone();
             coord.register(&catchup_topic, move |msg| {
                 let bytes = hex::decode(&msg.payload_hex).ok()?;
                 let req: CatchUp = serde_json::from_slice(&bytes).ok()?;
+                let cp = served.checkpoint.lock().unwrap().clone();
                 let log = served.log.lock().unwrap();
                 let tail: Vec<Entry> =
                     log.iter().filter(|e| e.version >= req.from).cloned().collect();
-                serde_json::to_vec(&tail).ok()
+                // Redirect only when the reader is asking below what the snapshot already covers.
+                let redirect = match &cp {
+                    Some(c) if req.from <= c.base => Some(c.clone()),
+                    _ => None,
+                };
+                serde_json::to_vec(&CatchUpReply { tail, redirect }).ok()
             });
         } else {
             // `trigger` carries "I need entries from version N" from the op-handler to the task
@@ -186,7 +284,8 @@ impl<S: StateMachine> Replicated<S> {
             });
             coord.client().subscribe(&op_topic).await?;
 
-            // Catch-up task: turn triggers into directed requests to the writer.
+            // Catch-up task: turn triggers into directed requests to the writer. Handles snapshot
+            // redirects (bootstrap from a checkpoint) when a loader is installed.
             let task_inner = inner.clone();
             let task_coord = coord.clone();
             let task_writer = writer_id.clone();
@@ -197,14 +296,24 @@ impl<S: StateMachine> Replicated<S> {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
-                    if let Ok(reply) =
-                        task_coord.client().request(&task_writer, &catchup_topic, &payload, 5_000).await
-                    {
-                        if let Ok(entries) = serde_json::from_slice::<Vec<Entry>>(&reply) {
-                            for e in entries {
-                                task_inner.ingest(e.version, e.op, &task_trig);
-                            }
-                        }
+                    let Ok(reply) = task_coord
+                        .client()
+                        .request(&task_writer, &catchup_topic, &payload, 5_000)
+                        .await
+                    else {
+                        continue;
+                    };
+                    let Ok(reply) = serde_json::from_slice::<CatchUpReply>(&reply) else {
+                        continue;
+                    };
+                    // If the writer compacted past our floor, load its snapshot first (only if a
+                    // loader is installed — the snapshot-aware reader path). This resets the state
+                    // machine to `cp.base`, after which the tail (cp.base+1..) applies contiguously.
+                    if let Some(cp) = reply.redirect {
+                        task_inner.load_checkpoint(&cp, &task_trig).await;
+                    }
+                    for e in reply.tail {
+                        task_inner.ingest(e.version, e.op, &task_trig);
                     }
                 }
             });
@@ -261,5 +370,76 @@ impl<S: StateMachine> Replicated<S> {
                 break;
             }
         }
+    }
+}
+
+// ===========================================================================================
+// Snapshot / bootstrap (additive; available only when the state machine implements `Snapshot`).
+// ===========================================================================================
+
+impl<S: Snapshot> Replicated<S> {
+    /// Open a **read replica** that bootstraps from the writer's latest snapshot (if any) instead of
+    /// replaying the whole log from version 1, then tails only newer ops. Equivalent to
+    /// [`reader`](Self::reader) for a writer that has never checkpointed (it just full-replays), so
+    /// this is always safe to use for a `Snapshot` state machine.
+    ///
+    /// The reader proves the keystone property: bootstrapping here reaches byte-for-byte the same
+    /// state a full replay would — the snapshot is the deterministic fold of every op `<= base`.
+    pub async fn snapshot_reader(coord: Coord, name: &str, writer: &str) -> Result<Self> {
+        let loader = Self::make_loader(&coord);
+        Self::open(coord, name, Some(writer.to_string()), Some(loader)).await
+    }
+
+    /// Build the snapshot loader closure: fetch the object by CID via `ce-rs` and [`Snapshot::load`].
+    fn make_loader(coord: &Coord) -> SnapLoader<S> {
+        let coord = coord.clone();
+        Arc::new(move |cid: String| {
+            let coord = coord.clone();
+            Box::pin(async move {
+                let bytes = coord.client().get_object(&cid).await?;
+                S::load(&bytes)
+            }) as BoxFut<Result<S>>
+        })
+    }
+
+    /// Take a checkpoint (writer only): serialize the current state, store it as a content-addressed
+    /// object via `ce-rs`, record the checkpoint at the current applied version, and **compact** the
+    /// log by dropping every entry at or below that version. Returns the [`Checkpoint`].
+    ///
+    /// Safe to call repeatedly; each call advances the compaction floor. Readers that bootstrap or
+    /// that ask for entries below the floor are redirected to the latest checkpoint. Readers already
+    /// caught up are unaffected (they keep tailing the live ops above the floor).
+    pub async fn checkpoint(&self) -> Result<Checkpoint> {
+        if !self.inner.is_writer {
+            bail!("checkpoint() on a read replica — only the writer may checkpoint");
+        }
+        // Snapshot the state + version atomically so the bytes match `base` exactly.
+        let (bytes, base) = {
+            let core = self.inner.core.lock().unwrap();
+            (core.sm.save()?, core.applied)
+        };
+        let cid = self.inner.coord.client().put_object(&bytes).await?;
+        let cp = Checkpoint { base, cid };
+        // Record the checkpoint, then compact: drop entries the snapshot now covers.
+        *self.inner.checkpoint.lock().unwrap() = Some(cp.clone());
+        self.inner.log.lock().unwrap().retain(|e| e.version > base);
+        Ok(cp)
+    }
+
+    /// The writer's current checkpoint, if it has taken one. Useful for tests and status displays.
+    pub fn current_checkpoint(&self) -> Option<Checkpoint> {
+        self.inner.checkpoint.lock().unwrap().clone()
+    }
+
+    /// The compaction floor: the highest version no longer retained in the live log (0 if never
+    /// compacted). Entries with `version <= compaction_floor()` live only in the snapshot.
+    pub fn compaction_floor(&self) -> Version {
+        self.inner.checkpoint.lock().unwrap().as_ref().map(|c| c.base).unwrap_or(0)
+    }
+
+    /// Serialize this replica's current state to bytes (the same encoding [`checkpoint`] stores).
+    /// Exposed so callers can snapshot without compacting, or persist locally.
+    pub fn snapshot_bytes(&self) -> Result<Vec<u8>> {
+        self.inner.core.lock().unwrap().sm.save()
     }
 }
