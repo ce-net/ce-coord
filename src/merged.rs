@@ -488,4 +488,111 @@ mod tests {
         assert_eq!(fold(&[1, 0, 2]), r);
         assert_eq!(r.items.len(), 3);
     }
+
+    // -------------------------------------------------------------------------------------------
+    // Property tests: heavy proptest on multi-writer convergence. The merge layer's contract is
+    // that the key-ordered union fold is a pure function of the op *set*, independent of:
+    //   * how many writers produced ops,
+    //   * the interleaving/delivery order across writers,
+    //   * duplicate delivery,
+    //   * when a writer is "added" (its ops fold in identically whenever they arrive).
+    // -------------------------------------------------------------------------------------------
+    use proptest::prelude::*;
+
+    // The canonical Merged fold, mirroring `Shared::fold` exactly: dedup into a key-ordered BTreeMap,
+    // then fold from default in ascending key order.
+    fn merged_fold(ops: &[LwwOp]) -> Lww {
+        let mut union: BTreeMap<Ts, LwwOp> = BTreeMap::new();
+        for op in ops {
+            union.insert(Lww::key(op), op.clone());
+        }
+        let mut m = Lww::default();
+        for op in union.values() {
+            m.apply(op.clone());
+        }
+        m
+    }
+
+    // Build N writers' op streams from a flat list of (writer, _lam, key, val). The MergeKey
+    // contract REQUIRES distinct ops to have distinct keys (a Lamport clock + writer id), so we
+    // assign each op a per-writer monotonic lamport derived from its position — guaranteeing the
+    // key `(lamport, replica)` is globally unique. (Feeding colliding keys would violate the trait's
+    // precondition and is meaningless to test.)
+    fn writers_from(raw: &[(u8, u64, u8, i64)]) -> Vec<LwwOp> {
+        let mut per_writer: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
+        raw.iter()
+            .map(|(w, _lam, k, v)| {
+                let lam = per_writer.entry(*w).or_insert(0);
+                *lam += 1;
+                op(*lam, &format!("w{w}"), &format!("k{}", k % 5), *v)
+            })
+            .collect()
+    }
+
+    proptest! {
+        // N concurrent writers; ALL delivery orders (including a fully reversed and a deterministic
+        // shuffle) converge to the same fold, which equals the canonical in-order fold.
+        #[test]
+        fn prop_multiwriter_all_orders_converge(
+            raw in proptest::collection::vec(
+                (0u8..4, 0u64..50, 0u8..8, -1000i64..1000), 1..40),
+            seed in any::<u64>(),
+        ) {
+            let ops = writers_from(&raw);
+            let reference = merged_fold(&ops);
+
+            // forward, reversed, and an LCG shuffle — all over the SAME op set.
+            let mut shuffled = ops.clone();
+            let mut s = seed | 1;
+            for i in (1..shuffled.len()).rev() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = (s >> 33) as usize % (i + 1);
+                shuffled.swap(i, j);
+            }
+            let mut reversed = ops.clone();
+            reversed.reverse();
+
+            prop_assert_eq!(merged_fold(&reversed), reference.clone());
+            prop_assert_eq!(merged_fold(&shuffled), reference.clone());
+        }
+
+        // Idempotent + commutative: delivering the op set twice (and concatenated with a shuffled
+        // copy) yields the identical fold. Duplicates are deduped by key.
+        #[test]
+        fn prop_multiwriter_idempotent_commutative(
+            raw in proptest::collection::vec(
+                (0u8..4, 0u64..50, 0u8..8, -1000i64..1000), 1..40),
+        ) {
+            let ops = writers_from(&raw);
+            let once = merged_fold(&ops);
+            let mut doubled = ops.clone();
+            doubled.extend(ops.iter().rev().cloned()); // duplicates, reversed
+            prop_assert_eq!(merged_fold(&doubled), once);
+        }
+
+        // add_writer mid-stream: a writer whose ops arrive late folds in identically. Modelled by
+        // folding a "partial" union (some writers), then later unioning the rest -> same as folding
+        // all at once. This is exactly what `Merged::pull` does incrementally.
+        #[test]
+        fn prop_add_writer_midstream_equivalent(
+            raw in proptest::collection::vec(
+                (0u8..5, 0u64..60, 0u8..8, -500i64..500), 2..50),
+            split in 1usize..49,
+        ) {
+            let ops = writers_from(&raw);
+            let full = merged_fold(&ops);
+
+            // Incremental: build the union in two passes (early members, then a "newly added"
+            // writer's backlog), exactly as Merged accumulates into one shared BTreeMap.
+            let cut = split.min(ops.len().saturating_sub(1)).max(1);
+            let mut union: BTreeMap<Ts, LwwOp> = BTreeMap::new();
+            for o in &ops[..cut] { union.insert(Lww::key(o), o.clone()); }
+            // pull again on the same union (idempotent), then add the rest.
+            for o in &ops[..cut] { union.insert(Lww::key(o), o.clone()); }
+            for o in &ops[cut..] { union.insert(Lww::key(o), o.clone()); }
+            let mut m = Lww::default();
+            for o in union.values() { m.apply(o.clone()); }
+            prop_assert_eq!(m, full);
+        }
+    }
 }

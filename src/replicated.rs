@@ -77,6 +77,70 @@ struct Core<S: StateMachine> {
     pending: BTreeMap<Version, Vec<u8>>,
 }
 
+/// The outcome of feeding one entry into the ordering core: did we advance, and (if a gap was
+/// observed) which version do we still need? Extracted as a pure value so the gap-repair algorithm
+/// can be unit-tested without a [`Coord`]/node. Returned by [`Core::feed`].
+#[derive(Debug, PartialEq, Eq)]
+enum Ingested {
+    /// Entry was a duplicate (`version <= applied`); nothing changed.
+    Duplicate,
+    /// Entry sat past the contiguous frontier: buffered. We still need version `need`.
+    Gap { need: Version },
+    /// Entry applied (possibly draining buffered successors); new frontier is `applied`.
+    Applied { applied: Version },
+}
+
+impl<S: StateMachine> Core<S> {
+    fn apply_one(&mut self, bytes: &[u8]) {
+        // A malformed op from an authenticated writer should never happen; if it does, skip it
+        // rather than poison the replica. (We still advance `applied` to keep the log contiguous.)
+        if let Ok(op) = serde_json::from_slice::<S::Op>(bytes) {
+            self.sm.apply(op);
+        }
+    }
+
+    /// Drain buffered entries that are now contiguous with `applied`. Pure; no I/O.
+    fn drain_contiguous(&mut self) {
+        loop {
+            let next_version = self.applied + 1;
+            match self.pending.remove(&next_version) {
+                Some(next) => {
+                    self.apply_one(&next);
+                    self.applied = next_version;
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Feed one received entry into the ordering core. This is the *entire* single-writer ordering
+    /// policy, isolated for testing: duplicates are ignored, gaps are buffered (and the missing
+    /// version reported), and a contiguous entry is applied then followed by any buffered run.
+    fn feed(&mut self, version: Version, op: Vec<u8>) -> Ingested {
+        if version <= self.applied {
+            return Ingested::Duplicate;
+        }
+        if version != self.applied + 1 {
+            self.pending.insert(version, op);
+            return Ingested::Gap { need: self.applied + 1 };
+        }
+        self.apply_one(&op);
+        self.applied = version;
+        self.drain_contiguous();
+        Ingested::Applied { applied: self.applied }
+    }
+
+    /// Install a checkpoint-loaded state at `base`, discarding buffered entries the snapshot already
+    /// covers, then draining any strictly-newer contiguous run on top. Pure; mirrors what
+    /// [`Inner::load_checkpoint`] does under the lock.
+    fn install_checkpoint(&mut self, sm: S, base: Version) {
+        self.sm = sm;
+        self.applied = base;
+        self.pending.retain(|v, _| *v > base);
+        self.drain_contiguous();
+    }
+}
+
 /// A boxed, owned future — avoids pulling in `futures` just for `BoxFuture`.
 type BoxFut<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
@@ -104,48 +168,21 @@ struct Inner<S: StateMachine> {
 }
 
 impl<S: StateMachine> Inner<S> {
-    fn apply_bytes(core: &mut Core<S>, bytes: &[u8]) {
-        // A malformed op from an authenticated writer should never happen; if it does, skip it
-        // rather than poison the replica. (We still advance `applied` to keep the log contiguous.)
-        if let Ok(op) = serde_json::from_slice::<S::Op>(bytes) {
-            core.sm.apply(op);
-        }
-    }
-
     /// Apply (or buffer) one received entry, repairing gaps via `trigger`. Idempotent and
-    /// safe to call from both the pump's op-handler and the catch-up task.
+    /// safe to call from both the pump's op-handler and the catch-up task. The ordering decision
+    /// itself lives in [`Core::feed`] (unit-tested without a node); this method only adapts it to
+    /// the lock, the gap-repair trigger, and the version watch.
     fn ingest(&self, version: Version, op: Vec<u8>, trigger: &mpsc::UnboundedSender<Version>) {
-        let newly_applied;
-        {
-            let mut core = self.core.lock().unwrap();
-            if version <= core.applied {
-                return; // already have it
-            }
-            if version != core.applied + 1 {
-                core.pending.insert(version, op); // gap: buffer and ask for the missing prefix
-                let need = core.applied + 1;
-                drop(core);
+        let outcome = self.core.lock().unwrap().feed(version, op);
+        match outcome {
+            Ingested::Duplicate => {}
+            Ingested::Gap { need } => {
                 let _ = trigger.send(need);
-                return;
             }
-            Self::apply_bytes(&mut core, &op);
-            core.applied = version;
-            // Drain any buffered entries that are now contiguous. Read the next version into a
-            // local first — `core` is a MutexGuard, so an inline `core.applied` read inside the
-            // `remove` call would alias the mutable borrow.
-            loop {
-                let next_version = core.applied + 1;
-                match core.pending.remove(&next_version) {
-                    Some(next) => {
-                        Self::apply_bytes(&mut core, &next);
-                        core.applied = next_version;
-                    }
-                    None => break,
-                }
+            Ingested::Applied { applied } => {
+                let _ = self.ver_tx.send(applied);
             }
-            newly_applied = core.applied;
         }
-        let _ = self.ver_tx.send(newly_applied);
     }
 
     /// Bootstrap from a checkpoint: fetch + deserialize the snapshot via the installed loader, then
@@ -181,21 +218,7 @@ impl<S: StateMachine> Inner<S> {
             if core.applied >= cp.base {
                 return;
             }
-            core.sm = sm;
-            core.applied = cp.base;
-            // Drop buffered entries already covered by the snapshot; keep the strictly-newer ones.
-            core.pending.retain(|v, _| *v > cp.base);
-            // Drain any now-contiguous buffered entries on top of the snapshot.
-            loop {
-                let next_version = core.applied + 1;
-                match core.pending.remove(&next_version) {
-                    Some(next) => {
-                        Self::apply_bytes(&mut core, &next);
-                        core.applied = next_version;
-                    }
-                    None => break,
-                }
-            }
+            core.install_checkpoint(sm, cp.base);
             newly_applied = core.applied;
         }
         let _ = self.ver_tx.send(newly_applied);
@@ -441,5 +464,242 @@ impl<S: Snapshot> Replicated<S> {
     /// Exposed so callers can snapshot without compacting, or persist locally.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>> {
         self.inner.core.lock().unwrap().sm.save()
+    }
+}
+
+// ===========================================================================================
+// In-crate unit + property tests for the ordering core (no node / mesh required). The reader's
+// gap-repair / dedup / drain / checkpoint-install policy is the heart of single-writer replication;
+// here it is exercised in isolation through `Core::feed` / `Core::install_checkpoint`, which the
+// production `ingest` / `load_checkpoint` paths delegate to verbatim.
+// ===========================================================================================
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    // A KV state machine whose applied state == the BTreeMap fold of its ops. Deterministic and
+    // order-sensitive (a later Set for the same key clobbers an earlier one), so it detects any
+    // mis-ordering in the core.
+    #[derive(Default, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+    struct Kv {
+        map: std::collections::BTreeMap<String, i64>,
+    }
+    #[derive(Clone, Serialize, Deserialize)]
+    enum KvOp {
+        Set(String, i64),
+        Del(String),
+    }
+    impl StateMachine for Kv {
+        type Op = KvOp;
+        fn apply(&mut self, op: KvOp) {
+            match op {
+                KvOp::Set(k, v) => {
+                    self.map.insert(k, v);
+                }
+                KvOp::Del(k) => {
+                    self.map.remove(&k);
+                }
+            }
+        }
+    }
+    impl crate::snapshot::Snapshot for Kv {
+        crate::json_snapshot!();
+    }
+
+    fn enc(op: &KvOp) -> Vec<u8> {
+        serde_json::to_vec(op).unwrap()
+    }
+
+    fn fresh() -> Core<Kv> {
+        Core { sm: Kv::default(), applied: 0, pending: BTreeMap::new() }
+    }
+
+    /// In-order delivery applies each entry and advances the frontier by one.
+    #[test]
+    fn feed_in_order_applies_sequentially() {
+        let mut c = fresh();
+        assert_eq!(c.feed(1, enc(&KvOp::Set("a".into(), 1))), Ingested::Applied { applied: 1 });
+        assert_eq!(c.feed(2, enc(&KvOp::Set("b".into(), 2))), Ingested::Applied { applied: 2 });
+        assert_eq!(c.applied, 2);
+        assert_eq!(c.sm.map["a"], 1);
+        assert_eq!(c.sm.map["b"], 2);
+    }
+
+    /// A duplicate (version <= applied) is reported and changes nothing.
+    #[test]
+    fn feed_duplicate_is_ignored() {
+        let mut c = fresh();
+        c.feed(1, enc(&KvOp::Set("a".into(), 1)));
+        assert_eq!(c.feed(1, enc(&KvOp::Set("a".into(), 999))), Ingested::Duplicate);
+        assert_eq!(c.sm.map["a"], 1, "duplicate must not re-apply");
+        assert_eq!(c.applied, 1);
+    }
+
+    /// A gap buffers the entry and reports the missing version; arrival of the gap fill drains the
+    /// whole buffered run in one step.
+    #[test]
+    fn feed_gap_buffers_then_drains() {
+        let mut c = fresh();
+        // Deliver 3, 4, 2 out of order before 1 arrives.
+        assert_eq!(c.feed(3, enc(&KvOp::Set("c".into(), 3))), Ingested::Gap { need: 1 });
+        assert_eq!(c.feed(4, enc(&KvOp::Set("d".into(), 4))), Ingested::Gap { need: 1 });
+        assert_eq!(c.feed(2, enc(&KvOp::Set("b".into(), 2))), Ingested::Gap { need: 1 });
+        assert_eq!(c.applied, 0, "nothing applies while v1 is missing");
+        // v1 arrives: applies 1, then drains 2,3,4 contiguously.
+        assert_eq!(c.feed(1, enc(&KvOp::Set("a".into(), 1))), Ingested::Applied { applied: 4 });
+        assert_eq!(c.applied, 4);
+        assert_eq!(c.sm.map.len(), 4);
+        assert!(c.pending.is_empty(), "buffer drained");
+    }
+
+    /// Partial drain: a gap fill that only bridges part of the buffer advances to the first hole.
+    #[test]
+    fn feed_partial_drain_stops_at_next_hole() {
+        let mut c = fresh();
+        c.feed(2, enc(&KvOp::Set("b".into(), 2)));
+        c.feed(4, enc(&KvOp::Set("d".into(), 4))); // 3 is missing
+        assert_eq!(c.feed(1, enc(&KvOp::Set("a".into(), 1))), Ingested::Applied { applied: 2 });
+        assert_eq!(c.applied, 2, "stops before the v3 hole");
+        assert!(c.pending.contains_key(&4));
+        // 3 arrives -> drains 3 and 4.
+        assert_eq!(c.feed(3, enc(&KvOp::Set("c".into(), 3))), Ingested::Applied { applied: 4 });
+        assert_eq!(c.applied, 4);
+    }
+
+    /// A malformed op (not decodable into `S::Op`) does NOT poison the replica: the frontier still
+    /// advances (so the log stays contiguous) and later ops keep applying.
+    #[test]
+    fn feed_malformed_op_skips_without_poisoning() {
+        let mut c = fresh();
+        assert_eq!(c.feed(1, b"not json at all".to_vec()), Ingested::Applied { applied: 1 });
+        assert_eq!(c.applied, 1);
+        assert!(c.sm.map.is_empty(), "garbage op produced no state change");
+        // The next valid op still applies on top.
+        assert_eq!(c.feed(2, enc(&KvOp::Set("a".into(), 7))), Ingested::Applied { applied: 2 });
+        assert_eq!(c.sm.map["a"], 7);
+    }
+
+    /// install_checkpoint resets state to `base`, discards covered buffered entries, keeps newer
+    /// ones, and drains them on top.
+    #[test]
+    fn install_checkpoint_resets_and_drains_tail() {
+        let mut c = fresh();
+        // Buffer some out-of-order entries spanning the checkpoint base.
+        c.feed(2, enc(&KvOp::Set("b".into(), 2)));
+        c.feed(6, enc(&KvOp::Set("f".into(), 6)));
+        c.feed(7, enc(&KvOp::Set("g".into(), 7)));
+        // Snapshot state captured everything up to base=5 (here we hand it a concrete state).
+        let mut snap = Kv::default();
+        snap.map.insert("snap".into(), 100);
+        c.install_checkpoint(snap, 5);
+        assert_eq!(c.applied, 7, "drains buffered 6,7 on top of the base=5 snapshot");
+        assert_eq!(c.sm.map["snap"], 100);
+        assert_eq!(c.sm.map["f"], 6);
+        assert_eq!(c.sm.map["g"], 7);
+        assert!(!c.sm.map.contains_key("b"), "v2 was below base and discarded from the buffer");
+    }
+
+    /// install_checkpoint with no contiguous tail leaves applied exactly at base.
+    #[test]
+    fn install_checkpoint_without_tail_stays_at_base() {
+        let mut c = fresh();
+        c.feed(9, enc(&KvOp::Set("z".into(), 9))); // far gap, buffered
+        let snap = Kv::default();
+        c.install_checkpoint(snap, 3);
+        assert_eq!(c.applied, 3);
+        assert!(c.pending.contains_key(&9), "strictly-newer buffered entry retained");
+    }
+
+    use proptest::prelude::*;
+
+    // Reference fold: apply ops 1..=n in version order to a fresh state machine.
+    fn reference(ops: &[KvOp]) -> Kv {
+        let mut s = Kv::default();
+        for op in ops {
+            s.apply(op.clone());
+        }
+        s
+    }
+
+    proptest! {
+        // KEYSTONE convergence: feed the SAME versioned log to the core in an ARBITRARY delivery
+        // permutation (with duplicates) and it must converge to the exact in-version-order fold.
+        // This is the core's whole contract: order-independent, duplicate-tolerant convergence.
+        #[test]
+        fn prop_arbitrary_delivery_order_converges(
+            vals in proptest::collection::vec(-1000i64..1000, 1..40),
+            // a permutation seed + duplicate factor
+            seed in any::<u64>(),
+        ) {
+            // Build a deterministic log: version i (1-based) sets key "k{i%5}" = vals[i].
+            let ops: Vec<KvOp> = vals.iter().enumerate().map(|(i, v)| {
+                if i % 7 == 6 { KvOp::Del(format!("k{}", i % 5)) }
+                else { KvOp::Set(format!("k{}", i % 5), *v) }
+            }).collect();
+            let n = ops.len() as u64;
+            let want = reference(&ops);
+
+            // Deterministic shuffle of versions 1..=n, with every entry delivered twice (dup test).
+            let mut order: Vec<u64> = (1..=n).chain(1..=n).collect();
+            // simple LCG shuffle keyed by seed
+            let mut s = seed | 1;
+            for i in (1..order.len()).rev() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = (s >> 33) as usize % (i + 1);
+                order.swap(i, j);
+            }
+
+            let mut c = fresh();
+            for v in order {
+                let op = enc(&ops[(v - 1) as usize]);
+                c.feed(v, op);
+            }
+            // Even with arbitrary order + duplicates, if everything was delivered the frontier is n
+            // and the state equals the in-order fold.
+            prop_assert_eq!(c.applied, n);
+            prop_assert_eq!(c.sm, want);
+            prop_assert!(c.pending.is_empty());
+        }
+
+        // Idempotence: feeding the full log a second time changes nothing.
+        #[test]
+        fn prop_replay_is_idempotent(vals in proptest::collection::vec(-100i64..100, 1..25)) {
+            let ops: Vec<KvOp> = vals.iter().enumerate()
+                .map(|(i, v)| KvOp::Set(format!("k{}", i % 4), *v)).collect();
+            let n = ops.len() as u64;
+            let mut c = fresh();
+            for v in 1..=n { c.feed(v, enc(&ops[(v-1) as usize])); }
+            let after_first = c.sm.clone();
+            for v in 1..=n { c.feed(v, enc(&ops[(v-1) as usize])); }
+            prop_assert_eq!(c.sm, after_first);
+            prop_assert_eq!(c.applied, n);
+        }
+
+        // Checkpoint equivalence at every cut: install a snapshot of the first `base` ops, then
+        // deliver the tail in arbitrary order -> equals the full in-order fold. This is the
+        // snapshot-bootstrap keystone, proven through the real core (not a hand-rolled replay).
+        #[test]
+        fn prop_snapshot_install_plus_tail_equals_full(
+            vals in proptest::collection::vec(-500i64..500, 1..30),
+            base_frac in 0u64..100,
+        ) {
+            let ops: Vec<KvOp> = vals.iter().enumerate()
+                .map(|(i, v)| KvOp::Set(format!("k{}", i % 6), *v)).collect();
+            let n = ops.len() as u64;
+            let base = base_frac * n / 100; // 0..=n
+            let want = reference(&ops);
+
+            // The snapshot is the deterministic fold of ops 1..=base.
+            let snap = reference(&ops[..base as usize]);
+            let mut c = fresh();
+            c.install_checkpoint(snap, base);
+            // Deliver the tail (base+1..=n) reversed, to prove order-independence post-bootstrap.
+            for v in ((base + 1)..=n).rev() {
+                c.feed(v, enc(&ops[(v - 1) as usize]));
+            }
+            prop_assert_eq!(c.applied, n);
+            prop_assert_eq!(c.sm, want);
+        }
     }
 }
