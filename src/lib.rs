@@ -18,6 +18,8 @@
 //! ## What you get
 //!
 //! * [`Stream<T>`] — a typed channel. `publish(&T)` on one node, `next().await` on others.
+//!   Delivery is best-effort, **at-least-once** (values may be dropped under load and may be
+//!   redelivered); handlers must tolerate gaps and duplicates. See [`stream`] for details.
 //! * [`RMap<K, V>`](collections::RMap) — a replicated map with one **writer** and any number of
 //!   **readers**. Mutations return a [`Version`](replicated::Version); readers
 //!   [`await_version`](collections::RMap::await_version) to confirm convergence.
@@ -125,6 +127,13 @@ impl Coord {
     ///
     /// Delivery is best-effort (the ring is capped) — which is why the replicated log carries
     /// version numbers and repairs gaps itself, rather than trusting the pump to see every message.
+    ///
+    /// De-dup is **best-effort, at-least-once**, not exactly-once. The window keeps the last 8192
+    /// fingerprints, so a message redelivered after more than 8192 newer ones can be dispatched
+    /// again. Handlers must therefore be idempotent: the replicated log ignores entries it has
+    /// already applied (by version), and [`Stream<T>`] is documented as at-least-once. The window is
+    /// keyed on the stable [`fingerprint`] (content/identity, not `received_at`), so a redelivery
+    /// that only changed its local timestamp is still recognised as a duplicate while in-window.
     fn spawn_pump(&self) {
         let coord = self.clone();
         tokio::spawn(async move {
@@ -161,6 +170,14 @@ impl Coord {
 }
 
 /// Stable fingerprint of a message for de-dup across polls.
+///
+/// Deliberately hashes only the stable content/identity of the message — sender, topic, payload,
+/// and `reply_token` — and **not** `received_at`. `received_at` is a *local* timestamp the node
+/// stamps on arrival; the same logical message redelivered (e.g. after a poll boundary, a retried
+/// publish, or a node restart) carries a fresh `received_at`, so including it would defeat de-dup
+/// exactly when de-dup is needed. The remaining fields uniquely identify a logical message: the same
+/// sender will not re-use a `reply_token`, and two genuinely distinct messages from one sender on one
+/// topic differ in their payload.
 fn fingerprint(m: &AppMessage) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -168,6 +185,76 @@ fn fingerprint(m: &AppMessage) -> u64 {
     m.topic.hash(&mut h);
     m.payload_hex.hash(&mut h);
     m.reply_token.hash(&mut h);
-    m.received_at.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(from: &str, topic: &str, payload_hex: &str, received_at: u64, reply_token: Option<u64>) -> AppMessage {
+        AppMessage {
+            from: from.to_string(),
+            topic: topic.to_string(),
+            payload_hex: payload_hex.to_string(),
+            received_at,
+            reply_token,
+        }
+    }
+
+    /// The fingerprint must ignore `received_at`: a redelivery that only re-stamps its local arrival
+    /// time is the same logical message and must collide, so the pump de-dups it.
+    #[test]
+    fn fingerprint_ignores_received_at() {
+        let a = msg("alice", "ce-coord/stream/x", "68656c6c6f", 1000, None);
+        let b = msg("alice", "ce-coord/stream/x", "68656c6c6f", 9999, None);
+        assert_eq!(
+            fingerprint(&a),
+            fingerprint(&b),
+            "messages differing only in received_at must share a fingerprint"
+        );
+    }
+
+    /// Genuinely distinct messages (different payload, sender, topic, or reply_token) must NOT
+    /// collide — otherwise de-dup would swallow real traffic.
+    #[test]
+    fn fingerprint_distinguishes_content() {
+        let base = msg("alice", "ce-coord/stream/x", "68656c6c6f", 1000, None);
+        assert_ne!(fingerprint(&base), fingerprint(&msg("bob", "ce-coord/stream/x", "68656c6c6f", 1000, None)));
+        assert_ne!(fingerprint(&base), fingerprint(&msg("alice", "ce-coord/stream/y", "68656c6c6f", 1000, None)));
+        assert_ne!(fingerprint(&base), fingerprint(&msg("alice", "ce-coord/stream/x", "776f726c64", 1000, None)));
+        assert_ne!(fingerprint(&base), fingerprint(&msg("alice", "ce-coord/stream/x", "68656c6c6f", 1000, Some(7))));
+    }
+
+    /// Drive the exact de-dup step the pump runs (`seen.insert(fingerprint(&msg))`): a message
+    /// redelivered with a fresh `received_at` is recognised as a duplicate and is NOT dispatched a
+    /// second time, while a different message still gets through.
+    #[test]
+    fn redelivery_with_new_received_at_is_not_redispatched() {
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut dispatched: Vec<String> = Vec::new();
+
+        // Simulate the pump's filter-then-dispatch for a stream of inbound messages.
+        let feed = |m: &AppMessage, seen: &mut HashSet<u64>, dispatched: &mut Vec<String>| {
+            if seen.insert(fingerprint(m)) {
+                dispatched.push(m.payload_hex.clone());
+            }
+        };
+
+        let first = msg("alice", "ce-coord/stream/x", "68656c6c6f", 1000, None);
+        // Same logical message, redelivered later with a different local timestamp.
+        let redelivered = msg("alice", "ce-coord/stream/x", "68656c6c6f", 4242, None);
+        // A genuinely new message.
+        let other = msg("alice", "ce-coord/stream/x", "776f726c64", 5000, None);
+
+        feed(&first, &mut seen, &mut dispatched);
+        feed(&redelivered, &mut seen, &mut dispatched);
+        feed(&other, &mut seen, &mut dispatched);
+
+        assert_eq!(
+            dispatched,
+            vec!["68656c6c6f".to_string(), "776f726c64".to_string()],
+            "redelivery with a new received_at must not be dispatched again; new content must be"
+        );
+    }
 }

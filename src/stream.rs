@@ -6,11 +6,16 @@
 //! `consume::<T>()` with the same one-line ergonomics, riding CE's signed gossip — so subscribers
 //! get the authenticated sender for free if they want it.
 //!
-//! Delivery is at-most-once under load (the node's inbox ring is bounded); a stream is the right
-//! tool for telemetry, presence, and events, not for state you can't lose. For replicated state
-//! that must converge, use [`RMap`](crate::RMap) / [`Replicated`](crate::Replicated), which repair
-//! gaps. Note that gossip does not echo your own publishes back to you — publisher and subscriber
-//! are different nodes.
+//! **Delivery is best-effort with at-least-once semantics, never exactly-once.** A value can be
+//! *lost* (the node's inbox ring is bounded, so under load gossip is dropped) and a value can be
+//! *redelivered* (the pump's de-dup window is bounded — see [`Coord`](crate::Coord) — so a message
+//! that resurfaces after the window has rolled past it is handed to your consumer again). A stream
+//! is therefore the right tool for telemetry, presence, and events whose handlers tolerate both gaps
+//! and duplicates — not for state you can't lose or that must be applied exactly once. For
+//! replicated state that must converge, use [`RMap`](crate::RMap) /
+//! [`Replicated`](crate::Replicated): those carry version numbers, ignore already-applied entries,
+//! and repair gaps. Note that gossip does not echo your own publishes back to you — publisher and
+//! subscriber are different nodes.
 
 use anyhow::Result;
 use serde::de::DeserializeOwned;

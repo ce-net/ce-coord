@@ -81,8 +81,10 @@ instead of waiting for the next write. **Integrity** is free: the reader applies
 `msg.from == W`, and CE guarantees that field.
 
 A `Stream<T>` is just the `ce-coord/stream/<name>` pub/sub topic with `serde` on both ends — no log,
-no ordering, at-most-once. Use streams for events/telemetry, collections for state that must
-converge.
+no ordering, best-effort **at-least-once** delivery (a value may be dropped when the node's inbox
+ring overflows, and may be redelivered once it falls outside the pump's bounded de-dup window, so
+handlers must tolerate both gaps and duplicates). Use streams for events/telemetry, collections for
+state that must converge.
 
 ## How it scales
 
