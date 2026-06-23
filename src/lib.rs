@@ -50,6 +50,9 @@ pub mod replicated;
 pub mod snapshot;
 pub mod stream;
 
+#[doc(hidden)]
+pub mod testkit;
+
 pub use collections::{RCell, RCounter, RMap, RSet, RVec};
 pub use merged::{MergeKey, MergeMachine, Merged, WriterLog};
 pub use replicated::{Replicated, StateMachine, Version};
