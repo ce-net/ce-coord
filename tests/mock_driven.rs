@@ -534,6 +534,44 @@ async fn stream_structured_value() -> anyhow::Result<()> {
 }
 
 // ===========================================================================================
+// Streaming pump path: the mock now serves `GET /mesh/messages/stream` as real SSE, so the pump
+// consumes pushed frames in real time instead of falling back to polling. Every test above already
+// runs through this path (the mock no longer 404s the stream); this one pins it explicitly and
+// asserts the *latency* property the SSE pump exists for: a publish is delivered to a subscriber
+// well inside one 250ms poll interval, which the old poll-only pump could not guarantee.
+// ===========================================================================================
+#[tokio::test]
+async fn streaming_pump_delivers_with_low_latency() -> anyhow::Result<()> {
+    let node = MockNode::start();
+    let ca = Coord::with_client(node.client()).await?;
+    let cb = Coord::with_client(node.client()).await?;
+
+    let mut sub = cb.stream::<String>("rt").await?;
+    // Let the subscribe register and the streaming pump open its SSE connection.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pubr = ca.stream::<String>("rt").await?;
+
+    // Publish exactly one message and time how long it takes to surface. The mock's SSE handler
+    // polls the inbox every ~10ms, so a healthy streaming pump delivers in tens of ms — far under
+    // the 250ms a poll-only pump could add. We allow a generous 200ms ceiling so the assertion is
+    // about "sub-poll-interval", not a flaky tight bound, while still failing if the pump silently
+    // regressed to 250ms polling.
+    let t0 = std::time::Instant::now();
+    pubr.publish(&"now".to_string()).await?;
+    let got = tokio::time::timeout(Duration::from_secs(5), sub.next()).await;
+    let elapsed = t0.elapsed();
+    match got {
+        Ok(Some(v)) => assert_eq!(v, "now", "received the streamed value"),
+        other => panic!("expected the streamed event, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "streaming pump should deliver well inside one 250ms poll interval; took {elapsed:?}"
+    );
+    Ok(())
+}
+
+// ===========================================================================================
 // Writers are namespaced by node id: two writers on the same name never cross-contaminate.
 // ===========================================================================================
 #[tokio::test]

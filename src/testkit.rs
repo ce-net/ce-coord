@@ -153,6 +153,14 @@ fn handle_conn(mut stream: TcpStream, broker: Arc<Broker>) -> std::io::Result<()
         Some(r) => r,
         None => return Ok(()),
     };
+    // The inbox push stream (`GET /mesh/messages/stream`) is the real-time counterpart to the
+    // `GET /mesh/messages` poll. Unlike every other route it is *not* one fixed-length response:
+    // the connection stays open and the mock pushes each inbound message as an SSE `data:` frame
+    // the instant it lands, exactly as the node does. This exercises ce-coord's streaming pump
+    // path (not just the polling fallback the 404 used to force).
+    if req.method == "GET" && req.path == "/mesh/messages/stream" {
+        return serve_message_stream(&mut stream, &broker, &req);
+    }
     let (status, ctype, body) = route(&broker, &req);
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -162,6 +170,52 @@ fn handle_conn(mut stream: TcpStream, broker: Arc<Broker>) -> std::io::Result<()
     stream.write_all(&body)?;
     stream.flush()?;
     Ok(())
+}
+
+/// Serve `GET /mesh/messages/stream` as Server-Sent-Events: emit the SSE header block, then loop
+/// draining this node's inbox and writing one `data: <json AppMessage>\n\n` frame per message as it
+/// arrives. The connection is held open (with periodic `:keep-alive` comments) until the client
+/// disconnects — a write error (the client dropped the stream) ends the loop. This mirrors the
+/// node's push endpoint closely enough to drive ce-coord's streaming pump end-to-end.
+fn serve_message_stream(stream: &mut TcpStream, broker: &Arc<Broker>, req: &Req) -> std::io::Result<()> {
+    let node = broker.node_for(&req.token);
+    stream.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
+    )?;
+    stream.flush()?;
+    // Poll the inbox every 10ms (so delivery latency is ~tens of ms, well under a poll interval),
+    // and emit a keep-alive comment roughly once a second so a dropped client eventually surfaces as
+    // a write error and we stop looping.
+    let mut idle_ticks = 0u32;
+    loop {
+        // Drain whatever has queued for this node and push each as its own SSE frame.
+        let drained: Vec<WireMsg> = {
+            let mut nodes = broker.nodes.lock().unwrap();
+            match nodes.get_mut(&node) {
+                Some(st) => st.inbox.drain(..).collect(),
+                None => Vec::new(),
+            }
+        };
+        if drained.is_empty() {
+            idle_ticks += 1;
+            if idle_ticks >= 100 {
+                idle_ticks = 0;
+                if stream.write_all(b": keep-alive\n\n").is_err() || stream.flush().is_err() {
+                    return Ok(());
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        idle_ticks = 0;
+        for msg in drained {
+            let json = serde_json::to_string(&msg).unwrap();
+            let frame = format!("data: {json}\n\n");
+            if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Req>> {

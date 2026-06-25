@@ -23,6 +23,9 @@ serde_json = "1"
 hex = "0.4"
 tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
+# Consume the node's SSE message stream (CeClient::messages_stream yields a futures Stream); the
+# pump uses StreamExt::next to pull each pushed message in real time.
+futures-util = "0.3"
 # Used by the `#[doc(hidden)] testkit` module (an in-process mock CE node for tests). `net`/`sync`
 # are needed by the broker's TCP server; `sha2` by its content-addressed blob store.
 sha2 = "0.10"

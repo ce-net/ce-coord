@@ -67,6 +67,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ce_rs::{AppMessage, CeClient};
+use futures_util::StreamExt;
 
 /// A handler reacts to one inbound [`AppMessage`] on a topic it registered for. Returning
 /// `Some(bytes)` means "reply with these bytes" — the pump routes them back to the requester via
@@ -122,11 +123,24 @@ impl Coord {
         self.inner.handlers.lock().unwrap().insert(topic.to_string(), Arc::new(f));
     }
 
-    /// The single inbox pump: poll the node's message ring, de-dup, and dispatch each message to
-    /// the handler registered for its topic. One pump serves every stream and replica on this node.
+    /// The single inbox pump: receive every inbound message, de-dup, and dispatch each one to the
+    /// handler registered for its topic. One pump serves every stream and replica on this node.
     ///
-    /// Delivery is best-effort (the ring is capped) — which is why the replicated log carries
-    /// version numbers and repairs gaps itself, rather than trusting the pump to see every message.
+    /// **Real-time first, polling as fallback.** The pump prefers the node's Server-Sent-Events
+    /// push stream (`GET /mesh/messages/stream`, via [`CeClient::messages_stream`]): the node pushes
+    /// each message the instant it arrives, so collections and streams update with no added latency.
+    /// Polling [`messages`](CeClient::messages) every 250ms — the old behaviour — could add up to
+    /// 250ms of delay per hop; SSE removes it.
+    ///
+    /// If the stream can't be opened (e.g. a node build without the endpoint) or it errors /
+    /// disconnects, the pump falls back to a polling sweep and then retries the stream with capped
+    /// exponential backoff. Either way the **same** de-dup-and-dispatch path runs, so behaviour is
+    /// identical except for latency, and a redelivery seen across a stream-then-poll boundary (or a
+    /// reconnect) is still recognised as a duplicate by the shared fingerprint window.
+    ///
+    /// Delivery is best-effort (the node's ring is capped, and a reconnect can miss messages sent
+    /// while disconnected) — which is why the replicated log carries version numbers and repairs
+    /// gaps itself, rather than trusting the pump to see every message.
     ///
     /// De-dup is **best-effort, at-least-once**, not exactly-once. The window keeps the last 8192
     /// fingerprints, so a message redelivered after more than 8192 newer ones can be dispatched
@@ -137,35 +151,91 @@ impl Coord {
     fn spawn_pump(&self) {
         let coord = self.clone();
         tokio::spawn(async move {
-            // Bounded de-dup so a message seen across two polls isn't dispatched twice.
-            let mut seen_order: VecDeque<u64> = VecDeque::new();
-            let mut seen: HashSet<u64> = HashSet::new();
+            // Bounded de-dup shared across the stream and polling paths, so a message seen across a
+            // stream/poll boundary or a reconnect isn't dispatched twice.
+            let mut dedup = Dedup::new(8192);
+            // Capped exponential backoff between stream-connect attempts; reset on a clean connect.
+            let mut backoff = Duration::from_millis(250);
+            const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
             loop {
-                if let Ok(msgs) = coord.inner.ce.messages().await {
-                    for msg in msgs {
-                        let fp = fingerprint(&msg);
-                        if !seen.insert(fp) {
-                            continue;
-                        }
-                        seen_order.push_back(fp);
-                        if seen_order.len() > 8192 {
-                            if let Some(old) = seen_order.pop_front() {
-                                seen.remove(&old);
+                match coord.inner.ce.messages_stream().await {
+                    Ok(stream) => {
+                        // Connected: reset backoff and consume pushed messages in real time.
+                        backoff = Duration::from_millis(250);
+                        tokio::pin!(stream);
+                        loop {
+                            match stream.next().await {
+                                Some(Ok(msg)) => coord.inner.dispatch(&mut dedup, msg).await,
+                                // A single malformed frame: skip it, keep the stream open.
+                                Some(Err(_)) => continue,
+                                // Stream ended/closed: drop out to the reconnect path.
+                                None => break,
                             }
                         }
-                        let handler = coord.inner.handlers.lock().unwrap().get(&msg.topic).cloned();
-                        if let Some(h) = handler {
-                            if let Some(reply) = h(&msg) {
-                                if let Some(token) = msg.reply_token {
-                                    let _ = coord.inner.ce.reply(token, &reply).await;
-                                }
+                    }
+                    Err(_) => {
+                        // The stream couldn't be opened (endpoint missing, transport error). Fall
+                        // back to a single polling sweep so delivery still works, then back off.
+                        if let Ok(msgs) = coord.inner.ce.messages().await {
+                            for msg in msgs {
+                                coord.inner.dispatch(&mut dedup, msg).await;
                             }
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                // Either the stream dropped or we polled once; wait before reconnecting.
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         });
+    }
+}
+
+impl CoordInner {
+    /// De-dup one inbound message and, if fresh, dispatch it to its topic handler (routing any
+    /// reply back via the message's `reply_token`). Shared by the SSE and polling pump paths.
+    async fn dispatch(&self, dedup: &mut Dedup, msg: AppMessage) {
+        if !dedup.insert(fingerprint(&msg)) {
+            return;
+        }
+        let handler = self.handlers.lock().unwrap().get(&msg.topic).cloned();
+        if let Some(h) = handler {
+            if let Some(reply) = h(&msg) {
+                if let Some(token) = msg.reply_token {
+                    let _ = self.ce.reply(token, &reply).await;
+                }
+            }
+        }
+    }
+}
+
+/// A bounded sliding window of recently-seen fingerprints for at-least-once de-dup. Keeps the most
+/// recent `cap` fingerprints; older ones fall out (so a very-late redelivery may be re-dispatched).
+struct Dedup {
+    cap: usize,
+    order: VecDeque<u64>,
+    seen: HashSet<u64>,
+}
+
+impl Dedup {
+    fn new(cap: usize) -> Self {
+        Self { cap, order: VecDeque::new(), seen: HashSet::new() }
+    }
+
+    /// Record `fp`. Returns `true` if it was newly seen (caller should dispatch), `false` if it is
+    /// a duplicate currently in the window.
+    fn insert(&mut self, fp: u64) -> bool {
+        if !self.seen.insert(fp) {
+            return false;
+        }
+        self.order.push_back(fp);
+        if self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
     }
 }
 
@@ -226,17 +296,17 @@ mod tests {
         assert_ne!(fingerprint(&base), fingerprint(&msg("alice", "ce-coord/stream/x", "68656c6c6f", 1000, Some(7))));
     }
 
-    /// Drive the exact de-dup step the pump runs (`seen.insert(fingerprint(&msg))`): a message
+    /// Drive the exact de-dup step the pump runs (now `Dedup::insert(fingerprint(&msg))`): a message
     /// redelivered with a fresh `received_at` is recognised as a duplicate and is NOT dispatched a
     /// second time, while a different message still gets through.
     #[test]
     fn redelivery_with_new_received_at_is_not_redispatched() {
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut dedup = Dedup::new(8192);
         let mut dispatched: Vec<String> = Vec::new();
 
         // Simulate the pump's filter-then-dispatch for a stream of inbound messages.
-        let feed = |m: &AppMessage, seen: &mut HashSet<u64>, dispatched: &mut Vec<String>| {
-            if seen.insert(fingerprint(m)) {
+        let mut feed = |m: &AppMessage, dispatched: &mut Vec<String>| {
+            if dedup.insert(fingerprint(m)) {
                 dispatched.push(m.payload_hex.clone());
             }
         };
@@ -247,14 +317,51 @@ mod tests {
         // A genuinely new message.
         let other = msg("alice", "ce-coord/stream/x", "776f726c64", 5000, None);
 
-        feed(&first, &mut seen, &mut dispatched);
-        feed(&redelivered, &mut seen, &mut dispatched);
-        feed(&other, &mut seen, &mut dispatched);
+        feed(&first, &mut dispatched);
+        feed(&redelivered, &mut dispatched);
+        feed(&other, &mut dispatched);
 
         assert_eq!(
             dispatched,
             vec!["68656c6c6f".to_string(), "776f726c64".to_string()],
             "redelivery with a new received_at must not be dispatched again; new content must be"
         );
+    }
+
+    /// The streaming pump and the polling fallback share one [`Dedup`] window. A message that the
+    /// node first pushes over SSE and then re-delivers in a fallback polling sweep (the realistic
+    /// stream-drop-then-reconnect-via-poll boundary) must be dispatched exactly once.
+    #[test]
+    fn dedup_collapses_stream_then_poll_redelivery() {
+        let mut dedup = Dedup::new(8192);
+
+        let pushed = msg("alice", "ce-coord/stream/x", "68656c6c6f", 1000, None);
+        // After a reconnect the node re-serves the same logical message with a fresh local
+        // timestamp; the shared window must recognise it.
+        let repolled = msg("alice", "ce-coord/stream/x", "68656c6c6f", 2000, None);
+        let fresh = msg("alice", "ce-coord/stream/x", "776f726c64", 3000, None);
+
+        assert!(dedup.insert(fingerprint(&pushed)), "first delivery dispatches");
+        assert!(!dedup.insert(fingerprint(&repolled)), "stream→poll redelivery must be de-duped");
+        assert!(dedup.insert(fingerprint(&fresh)), "genuinely new content still dispatches");
+    }
+
+    /// The window is bounded: once more than `cap` distinct fingerprints have passed through, the
+    /// oldest falls out and a very-late redelivery of it can be dispatched again (the documented
+    /// at-least-once limit). A duplicate that is still in-window stays de-duped.
+    #[test]
+    fn dedup_window_evicts_oldest_beyond_cap() {
+        let mut dedup = Dedup::new(4);
+
+        assert!(dedup.insert(1));
+        assert!(dedup.insert(2));
+        assert!(!dedup.insert(2), "in-window duplicate is de-duped");
+        // Fill past the cap (1,2,3,4,5) so fingerprint 1 is evicted.
+        assert!(dedup.insert(3));
+        assert!(dedup.insert(4));
+        assert!(dedup.insert(5));
+        assert!(dedup.insert(1), "evicted fingerprint may be dispatched again");
+        // ...but 5 is still in-window.
+        assert!(!dedup.insert(5), "recent fingerprint is still de-duped");
     }
 }
