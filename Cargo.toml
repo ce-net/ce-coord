@@ -3,7 +3,7 @@ name = "ce-coord"
 version = "0.1.0"
 edition = "2024"
 description = "Self-organizing coordination primitives on the CE mesh — typed streams and single-writer replicated collections. An SDK library built ON CE primitives, not part of the node."
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/ce-net/ce-coord"
 
 [lib]
