@@ -27,10 +27,12 @@ assert_eq!(map.get(&"alice".into()), Some(100));
 |---|---|---|
 | `Stream<T>` | Typed pub/sub channel. `publish(&T)` / `next().await`. | `streams().produce/consume` |
 | `RMap<K,V>` | Replicated map: one writer, N readers, versioned convergence. | `Collections::Map` |
+| `RVec<T>` / `RSet<T>` / `RCell<T>` / `RCounter` | Replicated vec, set, single-value cell, and add-only counter — same writer/reader pattern as `RMap`. | `Collections::*` |
 | `Replicated<S>` | The engine. Replicate any `StateMachine` you define. | the RSM under Collections |
 
-`RVec` / `RSet` / `RCell` are the same three lines as `RMap` (state struct + op enum + `apply`); the
-reference impl ships `RMap` and shows the pattern in `src/collections.rs`.
+All replicated types (`RMap`, `RVec`, `RSet`, `RCell`, `RCounter`) ship fully implemented with
+`*_writer` / `*_reader` constructors in `src/collections.rs`; `Replicated<S>` is the shared engine
+for replicating any `StateMachine` you define.
 
 ## Do you need CE *and* this app?
 
